@@ -3019,6 +3019,24 @@ BLOCKED_CONFIG_MARKER = "[blocked_config]"
 BLOCKED_CONFIG_SILENT_MARKER = "[blocked_config:silent]"
 
 
+def _normalize_auto_pin(value):
+    """Treat the literal ``"auto"`` sentinel as unpinned.
+
+    Jobs created via ``cronjob create model=auto provider=auto`` persist the
+    sentinel string verbatim. Downstream resolution code interprets any
+    non-empty pin as an explicit choice, so without normalization the literal
+    ``"auto"`` reaches the wire as a model name (rejected, e.g. HTTP 401
+    "Model auto is not supported") or bypasses the cron-fleet / config
+    defaults on the provider axis and reroutes the run through the fallback
+    chain — silently spending an unrelated provider's balance every tick.
+    "auto" is not a model or provider literally named "auto"; it means
+    "follow the default resolution", so map it to ``None`` (unpinned).
+    """
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return None
+    return value
+
+
 def _cron_preflight_enabled(cfg: dict) -> bool:
     """Whether cron pre-dispatch configuration validation is enabled.
 
@@ -3048,12 +3066,14 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
         return None  # fail-open: never block on a preflight-internal error
 
     _cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
-    requested = (
-        job.get("provider")
-        or str((_cron_cfg or {}).get("model_provider") or "").strip()
-        or None
+    requested = _normalize_auto_pin(job.get("provider")) or str(
+        (_cron_cfg or {}).get("model_provider") or ""
+    ).strip() or None
+    model = (
+        _normalize_auto_pin(job.get("model"))
+        or os.getenv("HERMES_MODEL")
+        or ""
     )
-    model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
     from hermes_cli.auth import AuthError
 
@@ -3747,7 +3767,13 @@ def run_job(
         # re-read from storage every tick so a ``cronjob action=update
         # model=...`` after a failed run takes effect on the next tick — there
         # is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        #
+        # Normalize the literal ``"auto"`` sentinel (see ``_normalize_auto_pin``)
+        # on both axes so the default resolution applies, mirroring the
+        # auxiliary-path normalization in agent/auxiliary_client.py.
+        _job_model_pinned = _normalize_auto_pin(job.get("model"))
+        _job_provider_pinned = _normalize_auto_pin(job.get("provider"))
+        model = _job_model_pinned or os.getenv("HERMES_MODEL") or ""
 
         # cron.model / cron.model_provider: a deliberate cron-fleet default
         # so unattended jobs stop shadowing chat `/model` switches. When an
@@ -3785,7 +3811,7 @@ def run_job(
                     _cron_default_provider = str(
                         _cron_cfg_for_model.get("model_provider") or ""
                     ).strip()
-                if not job.get("model"):
+                if not _job_model_pinned:
                     if _cron_default_model:
                         # Cron-fleet default beats the global chat model: it is
                         # the user's explicit "cron runs on this" setting.
@@ -3947,7 +3973,7 @@ def run_job(
             else ""
         )
         primary_provider_for_drift = (
-            str(job.get("provider") or "").strip().lower()
+            str(_job_provider_pinned or "").strip().lower()
             or configured_provider_for_drift
             or None
         )
@@ -3961,7 +3987,7 @@ def run_job(
                 # Per-job user pin wins; otherwise the cron-fleet default
                 # provider (cron.model_provider); otherwise resolve from
                 # persisted global config.
-                "requested": job.get("provider") or _cron_default_provider or None,
+                "requested": _job_provider_pinned or _cron_default_provider or None,
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
@@ -4054,7 +4080,7 @@ def run_job(
             _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
             if (
                 _provider_snapshot
-                and not (job.get("provider") or "").strip()
+                and not _job_provider_pinned
                 and not _cron_default_provider
             ):
                 _current_provider = str(
@@ -4067,7 +4093,7 @@ def run_job(
             _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
             if (
                 _model_snapshot
-                and not (job.get("model") or "").strip()
+                and not _job_model_pinned
                 and not _cron_default_model
             ):
                 _current_model = str(primary_model_for_drift or "").strip().lower()
